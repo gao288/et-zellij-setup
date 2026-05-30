@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# zjpick — interactive picker for zellij sessions, invoked by the Mac `zj` helper over et.
+# Lists running and resurrectable (EXITED) sessions, plus "new" and "shell only" options.
+
+set -uo pipefail
+
+# Colors only if stdout is a tty
+if [[ -t 1 ]]; then
+  b=$'\033[1m'; d=$'\033[2m'; r=$'\033[0m'
+  g=$'\033[32m'; y=$'\033[33m'
+else
+  b= d= r= g= y=
+fi
+
+# Clear any leftover prompt rendered by the et-launched shell so the menu starts clean
+clear 2>/dev/null || printf '\033[2J\033[H'
+
+declare -a names statuses ages
+raw="$(zellij list-sessions -n 2>/dev/null || true)"
+while IFS= read -r line; do
+  [[ -z "${line// /}" ]] && continue
+  names+=("${line%% *}")
+  if [[ "$line" == *"EXITED"* ]]; then statuses+=("exited"); else statuses+=("running"); fi
+  if [[ "$line" =~ \[Created\ ([^]]+)\ ago\] ]]; then
+    ages+=("${BASH_REMATCH[1]}")
+  else
+    ages+=("?")
+  fi
+done <<< "$raw"
+
+printf "\n  %sZellij sessions on $(hostname):%s\n\n" "$b" "$r"
+idx=1
+for i in "${!names[@]}"; do
+  if [[ "${statuses[$i]}" == "running" ]]; then
+    printf "   %s%2d)%s %s%-28s%s  %s● running%s   %s(%s ago)%s\n" \
+      "$b" "$idx" "$r" "$b" "${names[$i]}" "$r" "$g" "$r" "$d" "${ages[$i]}" "$r"
+  else
+    printf "   %s%2d)%s %-28s   %s○ exited%s    %s(%s ago — will resurrect)%s\n" \
+      "$b" "$idx" "$r" "${names[$i]}" "$y" "$r" "$d" "${ages[$i]}" "$r"
+  fi
+  ((idx++))
+done
+
+(( ${#names[@]} > 0 )) && echo
+printf "   %s n)%s new session    %s(prompts for name)%s\n" "$b" "$r" "$d" "$r"
+printf "   %s s)%s shell only     %s(no zellij)%s\n"        "$b" "$r" "$d" "$r"
+printf "   %s q)%s quit\n\n"                                  "$b" "$r"
+printf "Choice: "
+read -r choice
+
+case "${choice:-q}" in
+  q|Q) exit 0 ;;
+  n|N)
+    printf "Name: "; read -r name
+    [[ -z "$name" ]] && { echo "no name, aborting" >&2; exit 1; }
+    exec zellij attach -c "$name"
+    ;;
+  s|S)
+    exec "${SHELL:-/usr/bin/zsh}" -l
+    ;;
+  *)
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+      exec zellij attach "${names[$((choice-1))]}"
+    else
+      echo "invalid choice: $choice" >&2; exit 1
+    fi
+    ;;
+esac

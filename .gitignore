@@ -1,0 +1,6 @@
+# Personal config — copy config.example.sh to config.sh and edit
+config.sh
+
+# OS junk
+.DS_Store
+*.swp
