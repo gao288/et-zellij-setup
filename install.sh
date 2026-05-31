@@ -392,11 +392,21 @@ precmd_functions+=(_kkp_pop)
 # A launchd agent on the Mac listens on this port (socat → open-remote.sh)
 # and dispatches to Zed / VSCode / Cursor with ssh-remote into REMOTE_ALIAS.
 # Requires the zj/zjlong reverse tunnel to be up (default in those helpers).
+# Uses zsh's built-in TCP module (zsh/net/tcp). /dev/tcp/... is bash-only
+# and would fail under zsh — this works the same way without a subshell.
 export ET_REVERSE_PORT="@REVERSE_PORT@"
 _edit_send() {
+  emulate -L zsh
   local verb="$1" p="$(realpath -- "${2:-$PWD}")"
-  printf '%s|%s\n' "$verb" "$p" > /dev/tcp/127.0.0.1/$ET_REVERSE_PORT 2>/dev/null \
-    || print -u2 "edit: no listener on 127.0.0.1:$ET_REVERSE_PORT — zj reverse tunnel up? Mac launchd agent loaded?"
+  zmodload -F zsh/net/tcp b:ztcp 2>/dev/null || {
+    print -u2 "edit: zsh/net/tcp module unavailable on this zsh"; return 1
+  }
+  if ! ztcp 127.0.0.1 $ET_REVERSE_PORT 2>/dev/null; then
+    print -u2 "edit: no listener on 127.0.0.1:$ET_REVERSE_PORT — zj reverse tunnel up? Mac launchd agent loaded?"
+    return 1
+  fi
+  printf '%s|%s\n' "$verb" "$p" >&$REPLY
+  ztcp -c $REPLY
 }
 edit()   { _edit_send edit   "$@" }
 zed()    { _edit_send zed    "$@" }
