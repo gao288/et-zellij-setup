@@ -76,21 +76,30 @@ This repo combines them into one workflow with one command.
 A managed block of zsh helpers plus an installed picker:
 
 ```text
-zj                 Interactive picker — pick a running session,
-                   resurrect an exited one, create new, or drop to a
-                   plain shell. Carries your port forwards.
-zj <name>          Skip picker, attach or create <name> directly.
-zjlong [name]      Same as zj, plus `caffeinate -i` so the Mac
-                   doesn't idle-sleep mid-task.
+On the Mac:
+  zj                 Interactive picker — pick a running session,
+                     resurrect an exited one, create new, or drop to a
+                     plain shell. Carries your port forwards AND the
+                     reverse tunnel for editor dispatch (below).
+  zj <name>          Skip picker, attach or create <name> directly.
+  zjlong [name]      Same as zj, plus `caffeinate -i` so the Mac
+                     doesn't idle-sleep mid-task.
 
-zjx [name]         Same as zj but with no port forwards — safe to open
-                   in additional windows without fighting over local
-                   ports.
+  zjx [name]         Same as zj but with no port forwards / no reverse
+                     tunnel — safe to open in additional windows
+                     without fighting over local ports.
 
-zjls               List remote zellij sessions.
-zjkill <name>      Kill / clear a session (incl. resurrectable ones).
+  zjls               List remote zellij sessions.
+  zjkill <name>      Kill / clear a session (incl. resurrectable ones).
 
-zj --help          Cheat sheet (also: zjlong -h, zjx -h, etc.).
+  zj --help          Cheat sheet (also: zjlong -h, zjx -h, etc.).
+
+On the remote (in any zellij pane, once a primary `zj` is up):
+  edit [path]        Open <path> (default $PWD) in your *primary* editor
+                     on the Mac via Remote-SSH.
+  zed [path]         Specifically open in Zed.
+  code [path]        Specifically open in VSCode.
+  cursor [path]      Specifically open in Cursor.
 ```
 
 Under the hood:
@@ -110,6 +119,12 @@ Under the hood:
 - **KKP safety net:** A `precmd` hook on the remote pops one Kitty Keyboard
   Protocol enhancement level each prompt, mitigating multiplexer-layer
   desync from zellij detach/attach.
+- **Open-on-Mac editor dispatch:** A reverse tunnel from the remote to a
+  `launchd`-supervised `socat` listener on the Mac. Remote `edit <path>`
+  (or `zed`/`code`/`cursor`) sends the path back; the Mac dispatcher
+  spawns your editor's local Remote-SSH client against `REMOTE_ALIAS`.
+  You get the "open in Zed/VSCode/Cursor right here" reflex from inside
+  any remote pane, without the editor needing to own the connection.
 
 ---
 
@@ -180,17 +195,25 @@ after editing `config.sh` or the templates and nothing else in your
 ### What `./install.sh all` does
 
 **Mac:**
-- `brew install MisterTea/et/et zellij` (skips if already present)
+- `brew install MisterTea/et/et zellij socat` (skips packages already present)
+- Symlinks `code` / `cursor` CLIs from their `.app` bundles into
+  `~/.local/bin` for the editors you enable in `EDITORS_ENABLED`
 - Upserts a `Host <REMOTE_ALIAS>` block into `~/.ssh/config`
 - Upserts the `zj` / `zjlong` / `zjx` / `zjls` / `zjkill` zsh helpers
   (plus `_zj_help`, `_zj_free_forwards`) into `~/.zshrc`
+- Writes `~/.local/bin/open-remote.sh` (the editor dispatcher) and
+  loads a `launchd` agent at
+  `~/Library/LaunchAgents/local.et-zellij-setup.open-remote.plist` that
+  runs `socat` on `127.0.0.1:$REVERSE_PORT`
 
-**Remote (via ssh; will prompt for sudo password the first time):**
+**Remote (via ssh; first run will prompt for sudo, re-runs are sudo-free):**
 - Adds `ppa:jgmath2000/et`, `apt install et`, enables systemd `et.service`
+  (all skipped if `etserver` is already installed / active)
 - Downloads the `zellij` static binary to `~/.local/bin/zellij`
 - Upserts a PATH line into `~/.zshenv` so non-interactive shells can find
   `zellij` (this is what `et -c "zellij attach …"` runs under)
-- Upserts the KKP-pop `precmd` hook into `~/.zshrc`
+- Upserts a block in `~/.zshrc` containing the KKP-pop `precmd` hook
+  plus the `edit` / `zed` / `code` / `cursor` functions
 - Installs `zjpick` to `~/.local/bin/zjpick`
 
 ---
@@ -247,6 +270,8 @@ re-runs.
 | `IDENTITY_FILE` | Local SSH private key. `~` is expanded. |
 | `FORWARD_PORTS` | Space-separated `local:remote` pairs. `zj` auto-skips any whose local port is busy at connection time. |
 | `ET_PORT` | TCP port `etserver` listens on (default 2022). |
+| `REVERSE_PORT` | Local TCP port for the editor dispatch listener (default 8123). `zj`/`zjlong` add `et -r $REVERSE_PORT:$REVERSE_PORT` so remote `edit`/`zed`/`code`/`cursor` can reach the Mac. |
+| `EDITORS_ENABLED` | Space-separated list of editors to enable. Supported: `zed`, `code`, `cursor`. The first one is the default for bare `edit` (without an editor-specific alias) from the remote. |
 
 ---
 
@@ -278,6 +303,21 @@ re-runs.
   `LocalForward` lines. Plain `ssh <alias>` works for `scp`, `git`, ad-hoc
   one-off commands. For ad-hoc forwarding, use `ssh -L 3000:localhost:3000
   <alias>`.
+- **Editor dispatch is not transport-resilient.** Once Zed / VSCode /
+  Cursor opens via Remote-SSH, it's running its own SSH connection — that
+  one is NOT covered by `et`'s reconnect logic. If the connection drops,
+  the editor will need to reconnect on its own (most do this gracefully).
+  Only the *trigger* (`edit .` typed in a zellij pane) rides through `et`.
+- **Multiple `zj` windows and the reverse tunnel.** Only the *first* `zj`
+  window successfully binds the remote `REVERSE_PORT`; subsequent windows
+  will print a "port busy" warning from `et`. This is harmless — `edit`
+  invocations from any pane on the remote route through the first window's
+  tunnel. Use `zjx` for additional windows that don't need editor dispatch.
+- **Editor dispatch security.** The Mac dispatcher only accepts a `verb`
+  and a `path`; the SSH host is baked into the dispatcher at install time
+  (from `REMOTE_ALIAS`), so a stray connection to `127.0.0.1:REVERSE_PORT`
+  can't make you open arbitrary remote hosts. The listener is bound to
+  loopback only.
 
 ---
 

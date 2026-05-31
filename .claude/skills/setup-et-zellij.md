@@ -56,6 +56,8 @@ Required fields (defined in `config.example.sh`):
 | `IDENTITY_FILE` | Path to SSH key. Default to `~/.ssh/id_ed25519` if present, otherwise list keys found. |
 | `FORWARD_PORTS` | Space-separated `local:remote` pairs. Default to `3000:3000` and ask whether they want to add more. |
 | `ET_PORT` | TCP port for `etserver`. Default `2022`; only change if there's a known conflict. |
+| `REVERSE_PORT` | TCP port for the open-on-Mac editor dispatcher. Default `8123`; only change on conflict. |
+| `EDITORS_ENABLED` | Multi-select via `AskUserQuestion`. Detect which of zed/code/cursor have either a CLI on PATH (`command -v`) or the app at `/Applications/<Name>.app`. The first item in the resulting list is the default for bare `edit`. |
 
 After collecting, show a summary table and ask "Looks right?" before
 writing anything.
@@ -85,7 +87,14 @@ quoting style, comments).
 
 Run `./install.sh local` and stream output. Look for:
 
-- `✓ et:` and `✓ zellij:` (versions printed)
+- `✓ et:` and `✓ zellij:` and `✓ socat already installed` (or fresh install)
+- `✓ zed CLI:` / `✓ code CLI:` / `✓ cursor CLI:` lines for whichever editors
+  the user enabled. If the line starts with `!`, the editor was enabled but
+  its CLI / app wasn't found — surface this and ask whether to install or
+  drop the editor from the config.
+- `✓ ~/.local/bin/open-remote.sh`
+- `✓ launchd agent loaded, listening on 127.0.0.1:<REVERSE_PORT>` (a `!`
+  here usually means socat couldn't bind — check `/tmp/open-remote.err`)
 - `✓ ~/.ssh/config:` and `✓ ~/.zshrc:` block confirmations
 
 If `brew install MisterTea/et/et` is starting for the first time, warn the
@@ -124,8 +133,21 @@ Two checks:
    zsh -ic 'source ~/.zshrc; zj --help' 2>&1 | tail -30
    ```
 
+3. (Optional but useful) verify the editor dispatch chain without opening
+   the editor:
+   ```bash
+   printf 'bogus_verb|/tmp\n' | nc -w 1 127.0.0.1 8123
+   sleep 0.3
+   tail -3 /tmp/open-remote.err
+   ```
+   Expect `open-remote: unknown verb: bogus_verb` — confirms socat + the
+   dispatcher script are wired together. Don't run a real verb here; that
+   actually opens an editor window.
+
 Tell the user to run `source ~/.zshrc` in any open shell, or open a new
-window, then run `zj`.
+window, then run `zj`. To use the editor dispatch: from inside a zellij
+pane on the remote, `cd` somewhere and run `edit .` (or `zed .` / `code .`
+/ `cursor .` for a specific editor).
 
 ## Behavioral guidance
 

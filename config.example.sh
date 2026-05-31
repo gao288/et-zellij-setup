@@ -20,3 +20,15 @@ FORWARD_PORTS="3000:3000 18789:18789 5800:5800"
 
 # etserver TCP port. Default 2022.
 ET_PORT="2022"
+
+# --- Open-on-Mac dispatcher (`edit`, `zed`, `code`, `cursor` from remote) ---
+
+# Reverse tunnel port. `zj` / `zjlong` add `et -r $REVERSE_PORT:$REVERSE_PORT`
+# so remote `edit <path>` can write back to a launchd agent on this Mac that
+# opens the appropriate editor against ssh://REMOTE_ALIAS/<path>.
+REVERSE_PORT="8123"
+
+# Which editors to wire up. Space-separated.  Supported: zed, code, cursor.
+# The first one in this list is the default target for bare `edit` (no
+# verb-specific alias) from the remote.
+EDITORS_ENABLED="zed code"

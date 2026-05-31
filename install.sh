@@ -48,10 +48,12 @@ load_config() {
   Run: cp $SCRIPT_DIR/config.example.sh $SCRIPT_DIR/config.sh && \$EDITOR $SCRIPT_DIR/config.sh"
   # shellcheck disable=SC1090
   source "$cfg"
-  for v in REMOTE_ALIAS REMOTE_HOST REMOTE_USER IDENTITY_FILE FORWARD_PORTS ET_PORT; do
+  for v in REMOTE_ALIAS REMOTE_HOST REMOTE_USER IDENTITY_FILE FORWARD_PORTS \
+           ET_PORT REVERSE_PORT EDITORS_ENABLED; do
     [[ -n "${!v:-}" ]] || die "$v not set in config.sh"
   done
   IDENTITY_EXPANDED="${IDENTITY_FILE/#\~/$HOME}"
+  PRIMARY_EDITOR="$(printf '%s\n' $EDITORS_ENABLED | head -1)"
 }
 
 # ---------- LOCAL (Mac) ----------
@@ -76,6 +78,114 @@ install_local() {
     brew install zellij
     info "✓ zellij: $(zellij --version)"
   fi
+  if brew list socat >/dev/null 2>&1; then
+    info "✓ socat already installed (open-remote dispatcher)"
+  else
+    info "installing socat (open-remote dispatcher)..."
+    brew install socat
+  fi
+  local SOCAT_BIN="$(brew --prefix)/bin/socat"
+
+  # 1b. Ensure editor CLIs are reachable for the enabled editors
+  mkdir -p "$HOME/.local/bin"
+  for ed in $EDITORS_ENABLED; do
+    case "$ed" in
+      zed)
+        if command -v zed >/dev/null; then info "✓ zed CLI: $(command -v zed)"
+        else info "! zed enabled but no 'zed' CLI on PATH — install via Zed: 'Install CLI' command"; fi ;;
+      code)
+        if command -v code >/dev/null; then info "✓ code CLI: $(command -v code)"
+        else
+          local vsc="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+          if [[ -x "$vsc" ]]; then
+            ln -sf "$vsc" "$HOME/.local/bin/code"
+            info "✓ code CLI: symlinked $vsc → ~/.local/bin/code"
+          else
+            info "! code enabled but VSCode app not found at $vsc"
+          fi
+        fi ;;
+      cursor)
+        if command -v cursor >/dev/null; then info "✓ cursor CLI: $(command -v cursor)"
+        else
+          local crs="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+          if [[ -x "$crs" ]]; then
+            ln -sf "$crs" "$HOME/.local/bin/cursor"
+            info "✓ cursor CLI: symlinked $crs → ~/.local/bin/cursor"
+          else
+            info "! cursor enabled but Cursor app not found at $crs"
+          fi
+        fi ;;
+      *) info "! unknown editor in EDITORS_ENABLED: $ed (supported: zed code cursor)" ;;
+    esac
+  done
+
+  # 1c. Write open-remote dispatcher
+  local dispatcher="$HOME/.local/bin/open-remote.sh"
+  cat > "$dispatcher" <<DISPATCHER_EOF
+#!/usr/bin/env bash
+# open-remote.sh — managed by et-zellij-setup.  socat invokes this per
+# connection; we read "verb|path" on stdin and open the matching editor.
+set -uo pipefail
+
+REMOTE_ALIAS="$REMOTE_ALIAS"
+PRIMARY="$PRIMARY_EDITOR"
+
+read -r line
+verb="\${line%%|*}"
+path="\${line#*|}"
+path="\${path%\$'\r'}"
+
+[[ "\$path" = /* ]] || { echo "open-remote: invalid path: \$path" >&2; exit 1; }
+[[ "\$verb" == "edit" ]] && verb="\$PRIMARY"
+
+ZED="/usr/local/bin/zed"
+VSCODE="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+CURSOR="/Applications/Cursor.app/Contents/Resources/app/bin/cursor"
+
+case "\$verb" in
+  zed)    exec "\$ZED" "ssh://\$REMOTE_ALIAS\$path" ;;
+  code)   exec "\$VSCODE" --remote "ssh-remote+\$REMOTE_ALIAS" "\$path" -r ;;
+  cursor) exec "\$CURSOR" --remote "ssh-remote+\$REMOTE_ALIAS" "\$path" -r ;;
+  *)      echo "open-remote: unknown verb: \$verb" >&2; exit 1 ;;
+esac
+DISPATCHER_EOF
+  chmod +x "$dispatcher"
+  info "✓ ~/.local/bin/open-remote.sh"
+
+  # 1d. Write + reload launchd agent
+  local plist="$HOME/Library/LaunchAgents/local.et-zellij-setup.open-remote.plist"
+  mkdir -p "$(dirname "$plist")"
+  cat > "$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.et-zellij-setup.open-remote</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SOCAT_BIN</string>
+    <string>TCP-LISTEN:$REVERSE_PORT,bind=127.0.0.1,reuseaddr,fork</string>
+    <string>EXEC:$dispatcher</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/open-remote.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/open-remote.err</string>
+</dict>
+</plist>
+PLIST_EOF
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load -w "$plist"
+  if lsof -nP -iTCP:$REVERSE_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+    info "✓ launchd agent loaded, listening on 127.0.0.1:$REVERSE_PORT"
+  else
+    info "! launchd agent loaded but nothing on 127.0.0.1:$REVERSE_PORT — check /tmp/open-remote.err"
+  fi
 
   # 2. ~/.ssh/config Host block
   mkdir -p ~/.ssh
@@ -96,6 +206,7 @@ install_local() {
   IFS= read -r -d '' zrc_body <<'ZBLOCK' || true
 # --- Eternal Terminal + zellij (managed by et-zellij-setup) ---
 export ET_FORWARDS="@FORWARD_PORTS@"
+export ET_REVERSE_PORT="@REVERSE_PORT@"   # remote `edit/zed/code/cursor` dispatch
 
 unalias    zj zjlong zjx zjls zjkill zjto 2>/dev/null
 unfunction zj zjlong zjx zjls zjkill zjto _zj_help _zj_free_forwards 2>/dev/null
@@ -120,18 +231,25 @@ function _zj_help {
 
 zj — Eternal Terminal + zellij helpers (Mac → @REMOTE_HOST@)
 
-  PRIMARY  (port forwards 3000/18789/5800 follow the session, auto-skip if busy)
+  PRIMARY  (port forwards 3000/18789/5800 follow the session, auto-skip if busy
+            — plus reverse tunnel @REVERSE_PORT@ for remote `edit` → Mac editor)
     zj                 Interactive picker (running / resurrectable / new / shell)
     zj <name>          Attach or create <name> directly (skip picker)
     zjlong [name]      Same as zj, plus `caffeinate -i` (Mac won't idle-sleep)
 
-  SECONDARY  (no forwards — safe to open in additional windows)
+  SECONDARY  (no forwards / no reverse tunnel — safe in additional windows)
     zjx                Picker, no forwards
     zjx <name>         Attach or create <name>, no forwards
 
   UTILITIES
     zjls               List remote zellij sessions (status + age)
     zjkill <name>      Kill a session (incl. clearing EXITED ones)
+
+  REMOTE → MAC EDITOR (run on remote inside any zj pane)
+    edit [path]        Open path (default $PWD) in primary editor on Mac
+    zed [path]         → Zed via ssh://@REMOTE_ALIAS@/path
+    code [path]        → VSCode via Remote-SSH
+    cursor [path]      → Cursor via Remote-SSH
 
   HELP
     zj --help | -h     Show this message (also: zjlong -h, zjx -h)
@@ -153,11 +271,12 @@ function zj {
   local cmd
   if [[ -n "${1:-}" ]]; then cmd="zellij attach -c $1"; else cmd="zjpick"; fi
   local fwd="$(_zj_free_forwards)"
+  local rev="$ET_REVERSE_PORT:$ET_REVERSE_PORT"
   if [[ -n "$fwd" ]]; then
-    et @REMOTE_ALIAS@ -t "$fwd" -c "$cmd"
+    et @REMOTE_ALIAS@ -t "$fwd" -r "$rev" -c "$cmd"
   else
-    print -u2 "zj: all forward ports busy — connecting bare"
-    et @REMOTE_ALIAS@ -c "$cmd"
+    print -u2 "zj: all forward ports busy — connecting bare (reverse tunnel still attempted)"
+    et @REMOTE_ALIAS@ -r "$rev" -c "$cmd"
   fi
 }
 
@@ -166,11 +285,12 @@ function zjlong {
   local cmd
   if [[ -n "${1:-}" ]]; then cmd="zellij attach -c $1"; else cmd="zjpick"; fi
   local fwd="$(_zj_free_forwards)"
+  local rev="$ET_REVERSE_PORT:$ET_REVERSE_PORT"
   if [[ -n "$fwd" ]]; then
-    caffeinate -i et @REMOTE_ALIAS@ -t "$fwd" -c "$cmd"
+    caffeinate -i et @REMOTE_ALIAS@ -t "$fwd" -r "$rev" -c "$cmd"
   else
-    print -u2 "zjlong: all forward ports busy — connecting bare"
-    caffeinate -i et @REMOTE_ALIAS@ -c "$cmd"
+    print -u2 "zjlong: all forward ports busy — connecting bare (reverse tunnel still attempted)"
+    caffeinate -i et @REMOTE_ALIAS@ -r "$rev" -c "$cmd"
   fi
 }
 
@@ -198,6 +318,7 @@ ZBLOCK
   zrc_body="${zrc_body//@REMOTE_ALIAS@/$REMOTE_ALIAS}"
   zrc_body="${zrc_body//@REMOTE_HOST@/$REMOTE_HOST}"
   zrc_body="${zrc_body//@ET_PORT@/$ET_PORT}"
+  zrc_body="${zrc_body//@REVERSE_PORT@/$REVERSE_PORT}"
 
   printf "%s" "$zrc_body" | upsert_block ~/.zshrc
   info "✓ ~/.zshrc: et+zellij block (reload with: source ~/.zshrc)"
@@ -234,7 +355,9 @@ if ! command -v etserver >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo apt-get install -y et
 fi
-sudo systemctl enable --now et
+if ! systemctl is-active et >/dev/null 2>&1; then
+  sudo systemctl enable --now et
+fi
 info "✓ et:       $(et --version | head -1)"
 info "✓ etserver: $(systemctl is-active et) on $(ss -tln 2>/dev/null | awk '/:2022/{print $4; exit}')"
 
@@ -257,15 +380,30 @@ printf '%s\n' \
   | upsert_block "$HOME/.zshenv"
 info "✓ ~/.zshenv: PATH block"
 
-# 4. ~/.zshrc — KKP pop hook
-printf '%s\n' \
-  '# KKP pop on each prompt — safety net for zellij detach/attach desync.' \
-  '# Pops one KKP enhancement-stack level. Inner apps re-push their own level.' \
-  '# Only enable from KKP-capable terminals (Ghostty/Kitty/WezTerm).' \
-  '_kkp_pop() { printf "\e[<u" }' \
-  'precmd_functions+=(_kkp_pop)' \
-  | upsert_block "$HOME/.zshrc"
-info "✓ ~/.zshrc: KKP hook block"
+# 4. ~/.zshrc — KKP pop hook + edit/zed/code/cursor dispatch
+upsert_block "$HOME/.zshrc" <<'ZRC_REMOTE_EOF'
+# --- KKP safety net for zellij detach/attach desync ---
+# Pops one KKP enhancement-stack level on each prompt. Inner apps re-push
+# their own level. Only enable from KKP-capable terminals (Ghostty/Kitty/WezTerm).
+_kkp_pop() { printf "\e[<u" }
+precmd_functions+=(_kkp_pop)
+
+# --- Open current dir / arg on Mac via et reverse tunnel ---
+# A launchd agent on the Mac listens on this port (socat → open-remote.sh)
+# and dispatches to Zed / VSCode / Cursor with ssh-remote into REMOTE_ALIAS.
+# Requires the zj/zjlong reverse tunnel to be up (default in those helpers).
+export ET_REVERSE_PORT="@REVERSE_PORT@"
+_edit_send() {
+  local verb="$1" p="$(realpath -- "${2:-$PWD}")"
+  printf '%s|%s\n' "$verb" "$p" > /dev/tcp/127.0.0.1/$ET_REVERSE_PORT 2>/dev/null \
+    || print -u2 "edit: no listener on 127.0.0.1:$ET_REVERSE_PORT — zj reverse tunnel up? Mac launchd agent loaded?"
+}
+edit()   { _edit_send edit   "$@" }
+zed()    { _edit_send zed    "$@" }
+code()   { _edit_send code   "$@" }
+cursor() { _edit_send cursor "$@" }
+ZRC_REMOTE_EOF
+info "✓ ~/.zshrc: KKP hook + edit dispatch block"
 
 # 5. zjpick (uploaded separately to $HOME/.cache/zjpick.upload)
 if [[ -f "$HOME/.cache/zjpick.upload" ]]; then
@@ -294,9 +432,14 @@ install_remote() {
   ssh "${ssh_opts[@]}" "$target" "mkdir -p ~/.cache" >/dev/null
   scp -q "${ssh_opts[@]}" "$SCRIPT_DIR/zjpick" "$target:~/.cache/zjpick.upload"
 
-  # Stream the install script over ssh -t so sudo can prompt
+  # Stream the install script over ssh -t so sudo can prompt.
+  # Substitute @REVERSE_PORT@ in the remote script before sending so the
+  # remote zshrc block carries the resolved port literal.
   info "running remote installer..."
-  remote_script | ssh -t "${ssh_opts[@]}" "$target" 'bash -s'
+  local rscript
+  rscript="$(remote_script)"
+  rscript="${rscript//@REVERSE_PORT@/$REVERSE_PORT}"
+  printf '%s' "$rscript" | ssh -t "${ssh_opts[@]}" "$target" 'bash -s'
 }
 
 # ---------- main ----------
